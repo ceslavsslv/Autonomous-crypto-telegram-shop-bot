@@ -1,4 +1,5 @@
 aiogram
 python-dotenv
 btcpay
+flask
 sqlite3
