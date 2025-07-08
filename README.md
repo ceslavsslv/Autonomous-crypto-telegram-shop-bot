@@ -30,3 +30,16 @@
 - Admin product manager
 - Multilingual support
 - Telegram login integration
+
+ ## Webhook Listener (Flask)
+Run this separately with:
+```bash
+flask --app webhook.py run --port=3000
+```
+
+Set your BTCPay Server webhook to:
+```
+https://yourdomain.com/btcpay_webhook
+```
+
+Make sure to use the same secret from `WEBHOOK_SECRET` environment variable.

@@ -1,38 +1,109 @@
+# ---------------- bot.py ----------------
+from aiogram import Bot, Dispatcher, Router, F, types
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 import asyncio
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import Message
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.utils import executor
 from config import API_TOKEN
-from database import init_db
-from handlers import start, shop, city_callback, product_callback, option_callback, ShopFlow
+from database import init_db, get_user_balance, create_or_get_user
 
+router = Router()
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot, storage=MemoryStorage())
+dp = Dispatcher()
+dp.include_router(router)
 
-@dp.message_handler(commands=["start"])
-async def handle_start(msg: Message):
-    await start(msg)
+# States
+class ShopStates(StatesGroup):
+    city = State()
+    product = State()
+    option = State()
 
-@dp.message_handler(commands=["shop"])
-async def handle_shop(msg: Message):
-    await shop(msg, dp.current_state(user=msg.from_user.id))
+# Start
+@router.message(F.text == "/start")
+async def start_cmd(message: Message, state: FSMContext):
+    create_or_get_user(message.from_user.id)
+    await message.answer("Welcome to the Crypto Shop Bot! Use /shop to begin.")
 
-@dp.callback_query_handler(lambda c: c.data.startswith("city_"), state=ShopFlow.ChoosingCity)
-async def handle_city(call, state):
-    await city_callback(call, state)
+@router.message(F.text == "/shop")
+async def choose_city(message: Message, state: FSMContext):
+    from database import get_db
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, name FROM cities")
+        cities = cur.fetchall()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("product_"), state=ShopFlow.ChoosingProduct)
-async def handle_product(call, state):
-    await product_callback(call, state)
+    kb = InlineKeyboardBuilder()
+    for city in cities:
+        kb.button(text=city["name"], callback_data=f"city_{city['id']}")
+    await message.answer("Choose a city:", reply_markup=kb.as_markup())
 
-@dp.callback_query_handler(lambda c: c.data.startswith("option_"), state=ShopFlow.ChoosingAmount)
-async def handle_option(call, state):
-    await option_callback(call, state)
+# Choose City
+@router.callback_query(F.data.startswith("city_"))
+async def select_city(callback: CallbackQuery, state: FSMContext):
+    city_id = int(callback.data.split("_")[1])
+    await state.update_data(city_id=city_id)
 
-def main():
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, name FROM products WHERE city_id = ?", (city_id,))
+        products = cur.fetchall()
+
+    kb = InlineKeyboardBuilder()
+    for product in products:
+        kb.button(text=product["name"], callback_data=f"product_{product['id']}")
+    kb.button(text="Back", callback_data="back_to_start")
+    await callback.message.edit_text("Choose a product:", reply_markup=kb.as_markup())
+
+# Choose Product
+@router.callback_query(F.data.startswith("product_"))
+async def select_product(callback: CallbackQuery, state: FSMContext):
+    product_id = int(callback.data.split("_")[1])
+    await state.update_data(product_id=product_id)
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, amount, price FROM product_options WHERE product_id = ?", (product_id,))
+        options = cur.fetchall()
+
+    kb = InlineKeyboardBuilder()
+    for opt in options:
+        kb.button(text=f"{opt['amount']} - {opt['price']}$", callback_data=f"option_{opt['id']}")
+    kb.button(text="Back", callback_data="back_to_start")
+    await callback.message.edit_text("Choose amount:", reply_markup=kb.as_markup())
+
+# Choose Option
+@router.callback_query(F.data.startswith("option_"))
+async def select_option(callback: CallbackQuery, state: FSMContext):
+    option_id = int(callback.data.split("_")[1])
+    from database import get_db, get_user_balance
+    telegram_id = callback.from_user.id
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT price, amount FROM product_options WHERE id = ?", (option_id,))
+        option = cur.fetchone()
+
+    balance = get_user_balance(telegram_id)
+
+    if balance < option["price"]:
+        await callback.message.answer("❌ Insufficient balance. Use /topup to add funds.")
+        return
+
+    # Save order
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO orders (user_id, option_id, status) VALUES ((SELECT id FROM users WHERE telegram_id = ?), ?, 'paid')",
+                    (telegram_id, option_id))
+        cur.execute("UPDATE users SET balance = balance - ? WHERE telegram_id = ?", (option["price"], telegram_id))
+
+    await callback.message.answer(f"✅ Purchase successful! You bought: {option['amount']}\nYou will receive instructions shortly.")
+    await callback.message.answer("📦 Your product is available at our pickup point. Please check your email or Telegram shortly.")
+
+# Run Bot
+async def main():
     init_db()
-    executor.start_polling(dp, skip_updates=True)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
